@@ -48,7 +48,9 @@ bool SupabaseTelemetryClient::publish(const TelemetryPayload& payload) const {
   http.addHeader(F("X-Device-Id"), deviceId_);
   http.addHeader(F("X-Device-Token"), deviceToken_);
 
-  const int statusCode = http.POST(reinterpret_cast<const uint8_t*>(body), strlen(body));
+  // Arduino core 3.x: POST(uint8_t*, size_t) takes a non-const buffer, so use
+  // the POST(String) overload instead of casting away constness from body.
+  const int statusCode = http.POST(String(body));
   http.end();
 
   if (statusCode < 200 || statusCode >= 300) {

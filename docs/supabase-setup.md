@@ -4,7 +4,15 @@ The `ingest-device` Edge Function accepts telemetry only from a provisioned devi
 
 ## One-time device provisioning
 
-On your own computer, generate a random device token and its SHA-256 hash. Keep the token private; only the hash belongs in the database.
+Preferred method, on your own computer from the repository root:
+
+```bash
+python3 scripts/provision-device.py
+```
+
+It asks for Wi-Fi SSID/password locally, generates a 32-byte token, writes the raw token only to the gitignored `config/local_config.h`, and prints only the SHA-256 hash plus its SQL insert. Paste that SQL into the Supabase SQL editor. The script never prints the raw token and never needs a database password or service_role key.
+
+Manual alternative, on your own computer: generate a random device token and its SHA-256 hash. Keep the token private; only the hash belongs in the database.
 
 ```powershell
 $bytes = [byte[]]::new(32)
