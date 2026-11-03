@@ -4,8 +4,13 @@
 #include <device_secrets.h>
 
 namespace {
-constexpr uint32_t kTelemetryIntervalMs = 60000;
-}
+// Periodic sensor cadence only. Motion events are not gated by this:
+// they are published on their PIR transition, immediately.
+constexpr uint32_t kSensorIntervalMs = 60000;
+// Retry a failed motion publish at most this often, so a Wi-Fi outage
+// does not turn every loop iteration into a blocking TLS attempt.
+constexpr uint32_t kMotionRetryIntervalMs = 5000;
+}  // namespace
 
 DeviceController::DeviceController()
     : dht11_(AppConfig::kDhtDataPin),
@@ -41,17 +46,67 @@ void DeviceController::update(uint32_t nowMs) {
     printDhtReading();
   }
 
+  handleMotionEvents(nowMs);
+
+  // Sensor readings are independent of motion: they are sent on their own
+  // cadence, and they carry no motion fields at all. A DHT failure blocks
+  // only this path, never a motion event.
   if (!latestDhtReading_.valid || !wifiManager_.isConnected() ||
       !telemetryClient_.isConfigured() ||
-      nowMs - lastTelemetryAtMs_ < kTelemetryIntervalMs) {
+      nowMs - lastSensorAtMs_ < kSensorIntervalMs) {
     return;
   }
 
-  lastTelemetryAtMs_ = nowMs;
-  telemetryClient_.publish({latestDhtReading_.temperatureC,
-                            latestDhtReading_.humidityPercent,
-                            motionAlarm_.isMotionDetected(),
-                            motionAlarm_.isAlarmActive(), nowMs});
+  lastSensorAtMs_ = nowMs;
+  if (telemetryClient_.publishSensorReading({latestDhtReading_.temperatureC,
+                                             latestDhtReading_.humidityPercent, nowMs})) {
+    Serial.println(F("Sensor reading sent to Supabase."));
+  }
+}
+
+void DeviceController::handleMotionEvents(uint32_t nowMs) {
+  const bool motionDetected = motionAlarm_.isMotionDetected();
+  if (motionDetected != lastMotionDetected_) {
+    lastMotionDetected_ = motionDetected;
+    PendingMotionEvent& pending =
+        motionDetected ? pendingStarted_ : pendingEnded_;
+    pending.active = true;
+    pending.motionStarted = motionDetected;
+    pending.uptimeMs = nowMs;
+    // Try immediately; publishPendingMotionEvents keeps it queued on failure.
+    lastMotionRetryAtMs_ = 0;
+  }
+
+  publishPendingMotionEvents(nowMs);
+}
+
+void DeviceController::publishPendingMotionEvents(uint32_t nowMs) {
+  if (!wifiManager_.isConnected() || !telemetryClient_.isConfigured()) {
+    return;
+  }
+  if (!pendingStarted_.active && !pendingEnded_.active) {
+    return;
+  }
+  if (nowMs - lastMotionRetryAtMs_ < kMotionRetryIntervalMs &&
+      lastMotionRetryAtMs_ != 0) {
+    return;
+  }
+
+  // Started before ended, so the event order in the database matches the
+  // physical order even after a failed first attempt.
+  PendingMotionEvent* pending =
+      pendingStarted_.active ? &pendingStarted_ : &pendingEnded_;
+  lastMotionRetryAtMs_ = nowMs;
+  if (telemetryClient_.publishMotionEvent(
+          {pending->motionStarted, pending->uptimeMs})) {
+    Serial.println(
+        pending->motionStarted ? F("Motion started event sent to Supabase.")
+                               : F("Motion ended event sent to Supabase."));
+    pending->active = false;
+    // A queued second transition (e.g. ended right after started) must
+    // not wait out the retry interval: only failures are throttled.
+    lastMotionRetryAtMs_ = 0;
+  }
 }
 
 void DeviceController::printDhtReading() {

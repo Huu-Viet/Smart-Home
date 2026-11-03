@@ -1,11 +1,35 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-type TelemetryRequest = {
+// Split payloads, one table per stream. The two streams are independent:
+// a sensor reading never carries motion fields, and a motion event never
+// carries temperature or humidity, so neither send is forced to include
+// the other, and statistics on one stream cannot be skewed by the other.
+//
+// Sensor (periodic, every 60 s from the device):
+//   { kind: "sensor", temperatureC, humidityPercent, uptimeMs, firmwareVersion }
+// Motion (event-driven, on each PIR transition):
+//   { kind: "motion", eventType: "motion_started" | "motion_ended",
+//     uptimeMs, firmwareVersion }
+//
+// The old bundled payload (temperature + motion + buzzer in one object,
+// no kind) is intentionally rejected with 400: it belonged to firmware
+// 0.1.0 and public.telemetry, which is deprecated. Deploy this function
+// together with the split migration, then flash firmware 0.2.0; during
+// the short window between the two, old firmware gets 400, not a
+// silent write to the wrong table.
+
+type SensorRequest = {
+  kind: "sensor";
   temperatureC: number;
   humidityPercent: number;
-  motionDetected: boolean;
-  buzzerActive: boolean;
+  uptimeMs: number;
+  firmwareVersion: string;
+};
+
+type MotionRequest = {
+  kind: "motion";
+  eventType: "motion_started" | "motion_ended";
   uptimeMs: number;
   firmwareVersion: string;
 };
@@ -31,16 +55,28 @@ function json(status: number, body: Record<string, unknown>): Response {
   });
 }
 
-function hasValidPayload(value: unknown): value is TelemetryRequest {
-  if (!value || typeof value !== "object") return false;
-  const data = value as Record<string, unknown>;
-  return Number.isFinite(data.temperatureC) && data.temperatureC >= -40 &&
-      data.temperatureC <= 85 && Number.isFinite(data.humidityPercent) &&
-      data.humidityPercent >= 0 && data.humidityPercent <= 100 &&
-      typeof data.motionDetected === "boolean" && typeof data.buzzerActive === "boolean" &&
-      Number.isInteger(data.uptimeMs) && data.uptimeMs >= 0 &&
+function hasValidUptimeAndVersion(data: Record<string, unknown>): boolean {
+  return Number.isInteger(data.uptimeMs) && data.uptimeMs >= 0 &&
       data.uptimeMs <= 4294967295 && typeof data.firmwareVersion === "string" &&
       data.firmwareVersion.length > 0 && data.firmwareVersion.length <= 64;
+}
+
+function hasValidSensorPayload(value: unknown): value is SensorRequest {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Record<string, unknown>;
+  return data.kind === "sensor" &&
+      Number.isFinite(data.temperatureC) && data.temperatureC >= -40 &&
+      data.temperatureC <= 85 && Number.isFinite(data.humidityPercent) &&
+      data.humidityPercent >= 0 && data.humidityPercent <= 100 &&
+      hasValidUptimeAndVersion(data);
+}
+
+function hasValidMotionPayload(value: unknown): value is MotionRequest {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Record<string, unknown>;
+  return data.kind === "motion" &&
+      (data.eventType === "motion_started" || data.eventType === "motion_ended") &&
+      hasValidUptimeAndVersion(data);
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -78,7 +114,9 @@ Deno.serve(async (request: Request) => {
     return json(400, { error: "invalid_json" });
   }
 
-  if (!hasValidPayload(payload)) return json(400, { error: "invalid_payload" });
+  const isSensor = hasValidSensorPayload(payload);
+  const isMotion = !isSensor && hasValidMotionPayload(payload);
+  if (!isSensor && !isMotion) return json(400, { error: "invalid_payload" });
 
   const supabase = createClient(Deno.env.get("SUPABASE_URL")!, getServiceKey());
   const { data: device, error: deviceError } = await supabase
@@ -92,17 +130,22 @@ Deno.serve(async (request: Request) => {
     return json(401, { error: "unauthorized" });
   }
 
-  const { error: telemetryError } = await supabase.from("telemetry").insert({
-    device_id: device.id,
-    temperature_c: payload.temperatureC,
-    humidity_percent: payload.humidityPercent,
-    motion_detected: payload.motionDetected,
-    buzzer_active: payload.buzzerActive,
-    uptime_ms: payload.uptimeMs,
-    firmware_version: payload.firmwareVersion,
-  });
+  const { error: writeError } = isSensor
+    ? await supabase.from("sensor_readings").insert({
+      device_id: device.id,
+      temperature_c: (payload as SensorRequest).temperatureC,
+      humidity_percent: (payload as SensorRequest).humidityPercent,
+      uptime_ms: (payload as SensorRequest).uptimeMs,
+      firmware_version: (payload as SensorRequest).firmwareVersion,
+    })
+    : await supabase.from("motion_events").insert({
+      device_id: device.id,
+      event_type: (payload as MotionRequest).eventType,
+      uptime_ms: (payload as MotionRequest).uptimeMs,
+      firmware_version: (payload as MotionRequest).firmwareVersion,
+    });
 
-  if (telemetryError) return json(500, { error: "telemetry_write_failed" });
+  if (writeError) return json(500, { error: "telemetry_write_failed" });
 
   const { error: deviceUpdateError } = await supabase
     .from("devices")
